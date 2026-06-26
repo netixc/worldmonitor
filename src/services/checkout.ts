@@ -1,12 +1,17 @@
 /**
- * Checkout overlay orchestration service.
+ * Checkout orchestration service (vanilla TS dashboard).
  *
- * Manages the full checkout lifecycle in the vanilla TS dashboard:
- * - Lazy-initializes the Dodo Payments overlay SDK
- * - Creates checkout sessions via the Convex createCheckout action
- * - Opens the overlay with dark-theme styling matching the dashboard
- * - Stores pending checkout intents for /pro handoff flows
- * - Handles overlay events (success, error, close)
+ * ACTIVE FLOW — redirect mode (#4449): `startCheckout(productId)` creates a Dodo
+ * checkout session via the Convex createCheckout action and then navigates the
+ * top window to Dodo's HOSTED checkout (`window.location.assign`). The overlay
+ * iframe could not host Dodo's nested 3DS/fraud stack, so card payments hung at
+ * "Processing…"; redirect runs 3DS/fraud unconstrained and #4447 returns the
+ * buyer to `/dashboard?wm_checkout=return` to reconcile.
+ *
+ * DORMANT — the Dodo overlay SDK machinery below (ensureCheckoutOverlayInitialized,
+ * the onEvent handler, the entitlement watchdog, openCheckout) is no longer on
+ * any live path (openCheckout has zero callers) and is kept pending removal. Do
+ * NOT assume the overlay is the checkout path when reading the handlers below.
  *
  * UI code calls startCheckout(productId) -- everything else is internal.
  */
@@ -17,6 +22,7 @@ import { openBillingPortal, prereserveBillingPortalTab } from './billing';
 import { getCurrentClerkUser, getClerkToken, openSignIn } from './clerk';
 import { subscribeAuthState } from './auth-state';
 import { saveCheckoutAttempt, clearCheckoutAttempt } from './checkout-attempt';
+import { safeHostedCheckoutUrl } from './hosted-checkout-url';
 import {
   classifyHttpCheckoutError,
   classifySyntheticCheckoutError,
@@ -889,12 +895,24 @@ export async function startCheckout(
     }
 
     const result = await resp.json();
-    if (result?.checkout_url) {
-      await openCheckout(result.checkout_url);
+    // #4449: navigate the top window to Dodo's HOSTED checkout instead of
+    // opening the overlay iframe. The overlay cannot host Dodo's nested 3DS/
+    // fraud stack (Hyperswitch → Airwallex → Sardine): our Permissions-Policy
+    // plus the Dodo SDK's own iframe `allow` attribute block the device sensors
+    // it needs two frames deep, so card payments requiring 3DS hung forever at
+    // "Processing…" (HAR-confirmed — see #4449/#4450). Dodo documents redirect
+    // as the primary flow; 3DS/fraud run unconstrained top-level and #4447
+    // returns the customer to /dashboard?wm_checkout=return to reconcile. The
+    // overlay machinery (openCheckout / ensureCheckoutOverlayInitialized / the
+    // event handler / watchdog) is left dormant pending removal.
+    const hostedCheckoutUrl = safeHostedCheckoutUrl(result?.checkout_url);
+    if (hostedCheckoutUrl) {
+      window.location.assign(hostedCheckoutUrl);
       return true;
     }
-    // 200 OK but no checkout_url is a server contract violation (the
-    // edge relayer returned success but the payload is unusable). Used
+    // 200 OK but no usable checkout_url — missing, or an untrusted/unparseable
+    // origin rejected by safeHostedCheckoutUrl — is a server contract violation
+    // (the edge relayer returned success but the payload is unusable). Used
     // to silently `return false` — the user saw nothing happen and the
     // bug was invisible in Sentry. Classify as service_unavailable
     // (closest accurate user-facing copy) and tag action so engineers
@@ -904,7 +922,7 @@ export async function startCheckout(
     const missingUrlError: CheckoutError = {
       code: 'service_unavailable',
       userMessage: 'Checkout is temporarily unavailable. Please try again in a moment.',
-      serverMessage: 'Server returned 200 without a checkout_url',
+      serverMessage: 'Server returned 200 without a usable checkout_url',
       httpStatus: resp.status,
       retryable: true,
     };

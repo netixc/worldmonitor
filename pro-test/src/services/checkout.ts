@@ -1,7 +1,12 @@
 /**
  * Checkout service for the /pro marketing page.
  *
- * Handles: Clerk sign-in → edge endpoint → Dodo overlay.
+ * ACTIVE FLOW (#4449): Clerk sign-in → edge endpoint → top-level redirect to
+ * Dodo's HOSTED checkout (`window.location.assign`). The overlay iframe could
+ * not host Dodo's nested 3DS/fraud stack (it hung at "Processing…"), so we
+ * navigate full-page; the buyer returns to the dashboard via the guarded
+ * `?wm_checkout=return` contract. The Dodo overlay SDK Initialize/onEvent
+ * machinery below is DORMANT, pending removal.
  * No Convex client needed — the edge endpoint handles relay.
  */
 
@@ -20,7 +25,7 @@ import {
   buildCheckoutReturnUrl,
 } from './checkout-intent-url';
 import { createEntitlementWatchdog, type EntitlementWatchdog } from './entitlement-watchdog';
-import { DASHBOARD_CHECKOUT_SUCCESS_URL } from '../routes';
+import { DASHBOARD_CHECKOUT_SUCCESS_URL, DASHBOARD_CHECKOUT_RETURN_URL } from '../routes';
 
 let checkoutInFlight = false;
 
@@ -228,11 +233,11 @@ export function initOverlay(onSuccess?: () => void): void {
         }
         if (event.event_type === 'checkout.redirect_requested') {
           const redirectTo = msg?.redirect_to as string | undefined;
-          // Dodo builds redirect_to from the return_url we sent, appending
-          // payment_id/subscription_id/status/license_key/email per
-          // changelog v1.84.0. Our return_url carries `?wm_checkout=success`
-          // so the dashboard bridge (src/services/checkout-return.ts) fires
-          // regardless of Dodo's appended params.
+          // DORMANT (#4449): this overlay handler no longer runs — checkout now
+          // redirects top-level to the hosted page (see startCheckout). The
+          // live return_url is the GUARDED `?wm_checkout=return` marker, which
+          // reconciles success only against authoritative Dodo evidence; it does
+          // NOT fire regardless of Dodo's appended params. Kept pending removal.
           fireTerminalSuccess('event-redirect', redirectTo);
         }
         if (event.event_type === 'checkout.closed') {
@@ -356,7 +361,13 @@ async function doCheckout(
       },
       body: JSON.stringify({
         productId,
-        returnUrl: DASHBOARD_CHECKOUT_SUCCESS_URL,
+        // #4449 review: use the GUARDED return contract, not the bare
+        // `?wm_checkout=success` marker. With hosted redirect now the primary
+        // flow, Dodo sends the buyer to this URL for EVERY outcome (success,
+        // failure, cancel, pending) — `?wm_checkout=success` would false-succeed
+        // a failed/pending/no-ID return. `?wm_checkout=return` only reconciles
+        // success against authoritative Dodo evidence. See checkout-return.ts.
+        returnUrl: DASHBOARD_CHECKOUT_RETURN_URL,
         discountCode: options.discountCode,
         referralCode: options.referralCode,
       }),
@@ -409,50 +420,28 @@ async function doCheckout(
     }
 
     const result = await resp.json();
-    if (!result?.checkout_url) {
-      console.error('[checkout] No checkout_url in response');
+    const hostedCheckoutUrl = safeHostedCheckoutUrl(result?.checkout_url);
+    if (!hostedCheckoutUrl) {
+      // 200 OK but no usable checkout_url (missing, or an untrusted/unparseable
+      // origin rejected by safeHostedCheckoutUrl). Report to Sentry for parity
+      // with the dashboard's missing-checkout-url path — otherwise this
+      // server-contract violation is invisible (was console.error only).
+      console.error('[checkout] No usable checkout_url in response');
+      Sentry.captureMessage('Checkout returned 200 without a usable checkout_url', {
+        level: 'error',
+        tags: { surface: 'pro-marketing', code: 'missing_checkout_url' },
+      });
       return false;
     }
 
-    const { DodoPayments } = await import('dodopayments-checkout');
-    DodoPayments.Checkout.open({
-      checkoutUrl: result.checkout_url,
-      options: {
-        // manualRedirect: true — Dodo emits `checkout.redirect_requested`
-        // with the final redirect URL and the MERCHANT performs the
-        // navigation. Reverting PR #3298's `false`: that mode disables
-        // both `checkout.status` and `checkout.redirect_requested` events
-        // (docs: "only when manualRedirect is enabled") and depends on
-        // the SDK's internal redirect, which fails for Safari users
-        // (stuck on a spinner with an orphaned about:blank tab). The
-        // correct flow per docs is manualRedirect:true + a
-        // checkout.redirect_requested handler — see onEvent above.
-        manualRedirect: true,
-        themeConfig: {
-          dark: {
-            bgPrimary: '#0d0d0d',
-            bgSecondary: '#1a1a1a',
-            borderPrimary: '#323232',
-            textPrimary: '#ffffff',
-            textSecondary: '#909090',
-            buttonPrimary: '#22c55e',
-            buttonPrimaryHover: '#16a34a',
-            buttonTextPrimary: '#0d0d0d',
-          },
-          light: {
-            bgPrimary: '#ffffff',
-            bgSecondary: '#f8f9fa',
-            borderPrimary: '#d4d4d4',
-            textPrimary: '#1a1a1a',
-            textSecondary: '#555555',
-            buttonPrimary: '#16a34a',
-            buttonPrimaryHover: '#15803d',
-            buttonTextPrimary: '#ffffff',
-          },
-          radius: '4px',
-        },
-      },
-    });
+    // #4449: navigate the top window to Dodo's HOSTED checkout instead of the
+    // overlay iframe. The overlay cannot host Dodo's nested 3DS/fraud stack
+    // (Hyperswitch → Airwallex → Sardine) — the device sensors it needs are
+    // blocked two frames deep, so card payments requiring 3DS hung forever at
+    // "Processing…" (HAR-confirmed; see #4449/#4450). Dodo documents redirect as
+    // the primary flow. The overlay Initialize/onEvent machinery above is left
+    // dormant pending removal.
+    window.location.assign(hostedCheckoutUrl);
 
     return true;
   } catch (err) {
@@ -462,6 +451,27 @@ async function doCheckout(
     checkoutInFlight = false;
     unmountCheckoutInterstitial();
     setPhase({ kind: 'idle' });
+  }
+}
+
+// Dodo's hosted-checkout origins. Redirect mode (#4449) navigates the top
+// window to the hosted checkout, so validate the server-provided `checkout_url`
+// before `window.location.assign` (open-redirect guard against an unexpected
+// origin / `javascript:` URL).
+const HOSTED_CHECKOUT_HOSTS = new Set([
+  'checkout.dodopayments.com',
+  'test.checkout.dodopayments.com',
+]);
+
+function safeHostedCheckoutUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:') return null;
+    if (!HOSTED_CHECKOUT_HOSTS.has(url.hostname)) return null;
+    return url.toString();
+  } catch {
+    return null;
   }
 }
 
