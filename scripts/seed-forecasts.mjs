@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { loadEnvFile, runSeed, CHROME_UA, withRetry, parseRetryAfterMs, getResponseHeader, isRetryableHttpStatus } from './_seed-utils.mjs';
 import { unwrapEnvelope } from './_seed-envelope-source.mjs';
 import { tagRegions } from './_prediction-scoring.mjs';
+import { attachResolutionSpecs } from './_forecast-resolution.mjs';
 import { resolveR2StorageConfig, putR2JsonObject, getR2JsonObject } from './_r2-storage.mjs';
 import { extractFirstJsonObject, extractFirstJsonArray, cleanJsonText } from './_llm-json.mjs';
 import { loadTickerSet } from './_ticker-validation.mjs';
@@ -947,6 +948,7 @@ function makePrediction(domain, region, title, probability, confidence, timeHori
     trend: 'stable',
     priorProbability: 0,
     calibration: null,
+    resolution: null,
     caseFile: null,
     generationOrigin: 'legacy_detector',
     stateDerivedBackfill: false,
@@ -4571,6 +4573,18 @@ function buildHistoryForecastEntry(pred) {
       effect: cascade.effect,
       probability: cascade.probability,
     })),
+    // Persist projections into the 45-day history too (#4933 audit gap —
+    // canonical payload already emits them at :5100; history was the only
+    // store dropping them, so the per-horizon curve a future multi-horizon
+    // Brier needs was lost). Mirror the canonical payload's shape.
+    projections: pred.projections ? {
+      h24: Number(pred.projections.h24 || 0),
+      d7: Number(pred.projections.d7 || 0),
+      d30: Number(pred.projections.d30 || 0),
+    } : null,
+    // Resolution spec (#4976 Bet 1) — same camelCase block the canonical
+    // payload emits, so Bet 2's resolver can score forecasts still in-window.
+    resolution: buildResolutionOutputBlock(pred.resolution),
   };
 }
 
@@ -5057,6 +5071,36 @@ function slimForecastCaseForPublish(caseFile = null) {
   };
 }
 
+// Emit the resolution spec (#4976 Bet 1) as a camelCase block (D6) matching
+// the generated `Forecast` type. Follows proto3-JSON omission semantics for
+// the message's `optional` fields: a field that does not apply to the kind is
+// OMITTED (absent key), never null and never coerced to 0 — a judged spec
+// with threshold 0 would be indistinguishable from a hard ">= 0" bar, and an
+// explicit null would contradict the generated `threshold?: number` type that
+// Bet-2 consumers compile against. `kind` and `deadline` are always present.
+// Deliberate divergence from the sibling `calibration: null` idiom:
+// ResolutionSpec is machine-consumed against the generated types, so the wire
+// shape matches what proto3 JSON actually specifies for unset optionals.
+// Returns undefined when the forecast has no spec, so the enclosing payload
+// omits `resolution` entirely (JSON.stringify drops undefined properties).
+// Shared by the canonical payload and the 45-day history entry (R6).
+function buildResolutionOutputBlock(resolution) {
+  if (!resolution || typeof resolution !== 'object') return undefined;
+  const num = (v) => (Number.isFinite(v) ? Number(v) : undefined);
+  const str = (v) => (typeof v === 'string' && v.length > 0 ? v : undefined);
+  return {
+    kind: str(resolution.kind),
+    deadline: num(resolution.deadline),
+    ...(str(resolution.metricKey) !== undefined && { metricKey: str(resolution.metricKey) }),
+    ...(str(resolution.operator) !== undefined && { operator: str(resolution.operator) }),
+    ...(num(resolution.threshold) !== undefined && { threshold: num(resolution.threshold) }),
+    ...(num(resolution.baselineValue) !== undefined && { baselineValue: num(resolution.baselineValue) }),
+    ...(str(resolution.window) !== undefined && { window: str(resolution.window) }),
+    ...(str(resolution.sourceFeed) !== undefined && { sourceFeed: str(resolution.sourceFeed) }),
+    ...(str(resolution.question) !== undefined && { question: str(resolution.question) }),
+  };
+}
+
 function buildPublishedForecastPayload(pred) {
   return {
     id: pred.id,
@@ -5102,6 +5146,7 @@ function buildPublishedForecastPayload(pred) {
       d7: Number(pred.projections.d7 || 0),
       d30: Number(pred.projections.d30 || 0),
     } : null,
+    resolution: buildResolutionOutputBlock(pred.resolution),
     caseFile: slimForecastCaseForPublish(pred.caseFile),
     simulationAdjustment: Number(pred.simulationAdjustment || 0),
     simPathConfidence: Number(pred.simPathConfidence || 0),
@@ -15441,6 +15486,11 @@ async function fetchForecasts() {
     : [[], null, null];
   const priorWorldState = priorWorldStates[0] ?? priorWorldStateFallback;
   const publishSelectionMemoryIndex = buildPublishSelectionMemoryIndex(priorWorldState);
+  // Single per-run timestamp: threaded into the resolution enrichment seam
+  // (so spec deadlines = runGeneratedAt + horizon) AND into the canonical
+  // payload's generatedAt below, so deadlines and the payload agree. Never
+  // call Date.now() inside the builder module (R5).
+  const runGeneratedAt = Date.now();
 
   console.log('  Reading input data from Redis...');
   const inputs = await readInputKeys();
@@ -15554,6 +15604,13 @@ async function fetchForecasts() {
     fullRunStateUnits,
     selectionMarketInputCoverage,
   );
+  // Resolvability contract (#4976 Bet 1, D1 seam): attach a machine-checkable
+  // resolution spec to every forecast. Placed AFTER the state-derived
+  // if-block closes (:15496) so it runs unconditionally on every batch —
+  // including zero-state-derived runs — and BEFORE prepareForecastMetrics.
+  // Threads the single per-run timestamp so spec deadlines agree with the
+  // canonical payload's generatedAt. No publish-selection change (D2).
+  attachResolutionSpecs(predictions, inputs, runGeneratedAt);
   attachMarketSelectionContext(predictions, marketSelectionIndex);
   prepareForecastMetrics(predictions);
 
@@ -15595,7 +15652,7 @@ async function fetchForecasts() {
     predictions: publishedPredictions,
     fullRunPredictions,
     inputs,
-    generatedAt: Date.now(),
+    generatedAt: runGeneratedAt,
     enrichmentMeta,
     publishTelemetry,
     publishSelectionPool,
@@ -17958,6 +18015,7 @@ export {
   writeForecastTraceArtifacts,
   buildForecastTraceArtifactKeys,
   parseForecastRunGeneratedAt,
+  readInputKeys,
   readForecastTraceArtifactsForRun,
   buildForecastRunStatusPayload,
   writeForecastRunStatusArtifact,
