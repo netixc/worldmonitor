@@ -28,7 +28,11 @@ const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 const { parseProxyConfig, resolveProxyString } = require('./_proxy-utils.cjs');
 const { countryNameToIso2 } = require('./shared/country-name-to-iso2.cjs');
-const { buildDedupMaterial } = require('./shared/notification-dedup.cjs');
+const {
+  buildDedupMaterial,
+  classifySetNxResult,
+  recordDedupOutcome,
+} = require('./shared/notification-dedup.cjs');
 const parseProxyUrl = parseProxyConfig;
 
 const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 6, timeout: 60_000 });
@@ -385,7 +389,7 @@ function upstashLpush(key, value) {
 
 function upstashSetNx(key, value, ttlSeconds) {
   return new Promise((resolve) => {
-    if (!UPSTASH_ENABLED) return resolve(null);
+    if (!UPSTASH_ENABLED) return resolve('disabled');
     const url = new URL('/', UPSTASH_REDIS_REST_URL);
     const serialized = typeof value === 'string' ? value : JSON.stringify(value);
     const body = JSON.stringify(['SET', key, serialized, 'NX', 'EX', String(ttlSeconds)]);
@@ -402,12 +406,12 @@ function upstashSetNx(key, value, ttlSeconds) {
       resp.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          resolve(parsed?.result === 'OK' ? 'OK' : null);
-        } catch { resolve(null); }
+          resolve(classifySetNxResult(parsed?.result));
+        } catch { resolve('error'); }
       });
     });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve('error'));
+    req.on('timeout', () => { req.destroy(); resolve('error'); });
     req.end(body);
   });
 }
@@ -616,15 +620,24 @@ async function publishNotificationEvent({ eventType, payload, severity, variant,
     const variantSuffix = variant ? `:${variant}` : '';
     const dedupMaterial = buildDedupMaterial(eventType, payload?.title, payload?.coalesceKey);
     const dedupKey = `wm:notif:scan-dedup:${eventType}${variantSuffix}:${notifySimpleHash(dedupMaterial)}`;
-    const isNew = await upstashSetNx(dedupKey, '1', dedupTtl);
-    if (!isNew) {
+    const dedupResult = await upstashSetNx(dedupKey, '1', dedupTtl);
+    const dedupDecision = recordDedupOutcome(dedupResult, {
+      surface: 'ais-relay',
+      eventType,
+      severity,
+      fallbackKey: dedupKey,
+      fallbackTtlSeconds: dedupTtl,
+      emitTelemetry: recordNotificationDedupSetNxError,
+    });
+    if (!dedupDecision.shouldPublish) {
+      if (!dedupDecision.isDuplicate) return;
       console.log(`[Notify] Dedup hit — ${eventType}: ${String(payload.title ?? '').slice(0, 60)}`);
       return;
     }
-    const msg = JSON.stringify({ eventType, payload, severity, ...(variant ? { variant } : {}), publishedAt: Date.now() });
+    const msg = JSON.stringify({ eventType, payload, severity: dedupDecision.severity, ...(variant ? { variant } : {}), publishedAt: Date.now() });
     const ok = await upstashLpush('wm:events:queue', msg);
     if (ok) {
-      console.log(`[Notify] Queued ${severity} event: ${eventType} — ${String(payload.title ?? '').slice(0, 60)}`);
+      console.log(`[Notify] Queued ${dedupDecision.severity} event: ${eventType} — ${String(payload.title ?? '').slice(0, 60)}`);
     } else {
       // Rollback the dedup key so the next poll cycle can retry — avoids silent
       // suppression for the full dedupTtl when a transient LPUSH fails.
@@ -6794,6 +6807,9 @@ const relayMetricsLifetime = {
   openskyMiss: 0,
   openskyUpstreamFetches: 0,
   drops: 0,
+  notificationDedupSetNxErrors: 0,
+  notificationDedupSetNxFailOpen: 0,
+  notificationDedupSetNxFailClosed: 0,
 };
 let relayMetricsQueueMaxLifetime = 0;
 let relayMetricsCurrentSec = 0;
@@ -6811,6 +6827,9 @@ function createRelayMetricsBucket() {
     openskyMiss: 0,
     openskyUpstreamFetches: 0,
     drops: 0,
+    notificationDedupSetNxErrors: 0,
+    notificationDedupSetNxFailOpen: 0,
+    notificationDedupSetNxFailClosed: 0,
     queueMax: 0,
   };
 }
@@ -6886,6 +6905,9 @@ function getRelayRollingMetrics() {
     rollup.openskyMiss += bucket.openskyMiss;
     rollup.openskyUpstreamFetches += bucket.openskyUpstreamFetches;
     rollup.drops += bucket.drops;
+    rollup.notificationDedupSetNxErrors += bucket.notificationDedupSetNxErrors;
+    rollup.notificationDedupSetNxFailOpen += bucket.notificationDedupSetNxFailOpen;
+    rollup.notificationDedupSetNxFailClosed += bucket.notificationDedupSetNxFailClosed;
     if (bucket.queueMax > rollup.queueMax) rollup.queueMax = bucket.queueMax;
   }
 
@@ -6914,6 +6936,11 @@ function getRelayRollingMetrics() {
       dropsPerSec: Number((rollup.drops / METRICS_WINDOW_SECONDS).toFixed(4)),
       upstreamPaused,
     },
+    notifications: {
+      dedupSetNxErrors: rollup.notificationDedupSetNxErrors,
+      dedupSetNxFailOpen: rollup.notificationDedupSetNxFailOpen,
+      dedupSetNxFailClosed: rollup.notificationDedupSetNxFailClosed,
+    },
     lifetime: {
       openskyRequests: relayMetricsLifetime.openskyRequests,
       openskyCacheHit: relayMetricsLifetime.openskyCacheHit,
@@ -6922,9 +6949,18 @@ function getRelayRollingMetrics() {
       openskyMiss: relayMetricsLifetime.openskyMiss,
       openskyUpstreamFetches: relayMetricsLifetime.openskyUpstreamFetches,
       drops: relayMetricsLifetime.drops,
+      notificationDedupSetNxErrors: relayMetricsLifetime.notificationDedupSetNxErrors,
+      notificationDedupSetNxFailOpen: relayMetricsLifetime.notificationDedupSetNxFailOpen,
+      notificationDedupSetNxFailClosed: relayMetricsLifetime.notificationDedupSetNxFailClosed,
       queueMax: relayMetricsQueueMaxLifetime,
     },
   };
+}
+
+function recordNotificationDedupSetNxError({ line, action }) {
+  incrementRelayMetric('notificationDedupSetNxErrors');
+  incrementRelayMetric(action === 'fail_open' ? 'notificationDedupSetNxFailOpen' : 'notificationDedupSetNxFailClosed');
+  console.warn(line);
 }
 
 // AIS aggregate state for snapshot API (server-side fanout)
